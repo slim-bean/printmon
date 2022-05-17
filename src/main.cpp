@@ -3,6 +3,7 @@
 #include <Wire.h>
 #include <ArduinoOTA.h>
 #include <GrafanaLoki.h>
+#include <PrometheusArduino.h>
 #include "config.h"
 #include "certificates.h"
 
@@ -23,7 +24,8 @@
 
 // Create a transport and client object for sending our data.
 PromLokiTransport transport;
-LokiClient client(transport);
+LokiClient loki(transport);
+PromClient prom(transport);
 
 SensirionI2CSen5x sen5x;
 
@@ -31,9 +33,17 @@ AsyncWebServer server(80);
 
 // Report sensor
 #define S_LENGTH 150
-LokiStream sensor(1, S_LENGTH, "{job=\"printmon\",type=\"sensor\"}");
-
+LokiStream lokiStream(1, S_LENGTH, "{job=\"printmon\",type=\"sensor\"}");
 LokiStreams streams(1);
+
+TimeSeries pm1(1, "pm1", "{job=\"printmon\"}");
+TimeSeries pm2_5(1, "pm2_5", "{job=\"printmon\"}");
+TimeSeries pm4(1, "pm4", "{job=\"printmon\"}");
+TimeSeries pm10(1, "pm10", "{job=\"printmon\"}");
+TimeSeries voc(1, "voc", "{job=\"printmon\"}");
+TimeSeries temp(1, "temp", "{job=\"printmon\"}");
+TimeSeries humidity(1, "humidity", "{job=\"printmon\"}");
+WriteRequest series(7);
 
 void printModuleVersions()
 {
@@ -124,6 +134,13 @@ void setup()
     serialTimeout++;
   }
 
+  // Setup Fan PWM port
+  ledcSetup(0, 25000, 8);
+  ledcAttachPin(9, 0);
+  ledcWrite(0, 0);
+  pinMode(10, OUTPUT);
+  digitalWrite(10, LOW);
+
   transport.setWifiSsid(WIFI_SSID);
   transport.setWifiPass(WIFI_PASS);
   transport.setNtpServer(NTP);
@@ -139,14 +156,26 @@ void setup()
   }
 
   // Configure the client
-  client.setUrl(URL);
-  client.setPath(PATH);
-  client.setPort(PORT);
-
-  client.setDebug(Serial); // Remove this line to disable debug logging of the client.
-  if (!client.begin())
+  loki.setUrl(URL);
+  loki.setPath(PATH);
+  loki.setPort(PORT);
+  loki.setDebug(Serial); // Remove this line to disable debug logging of the loki.
+  if (!loki.begin())
   {
-    Serial.println(client.errmsg);
+    Serial.println(loki.errmsg);
+    while (true)
+    {
+    };
+  }
+
+  // Configure the client
+  prom.setUrl(PROM_URL);
+  prom.setPath((char *)PROM_PATH);
+  prom.setPort(PORT);
+  prom.setDebug(Serial); // Remove this line to disable debug logging of the client.
+  if (!prom.begin())
+  {
+    Serial.println(prom.errmsg);
     while (true)
     {
     };
@@ -193,6 +222,11 @@ void setup()
         }
         long speedNum = speed.toInt();
         ledcWrite(0, speedNum);
+        if (speedNum == 0) {
+          digitalWrite(10, LOW);
+        } else {
+          digitalWrite(10, HIGH);
+        }
         request->send(200, "text/plain", "Speed set to: " + speed); });
   server.begin();
 
@@ -226,13 +260,17 @@ void setup()
     Serial.println(errorMessage);
   }
 
-  // Setup Fan PWM port
-  ledcSetup(0, 25000, 8);
-  ledcAttachPin(9, 0);
-  ledcWrite(0, 0);
-
-  streams.addStream(sensor);
+  streams.addStream(lokiStream);
   streams.setDebug(Serial);
+
+  series.addTimeSeries(pm1);
+  series.addTimeSeries(pm2_5);
+  series.addTimeSeries(pm4);
+  series.addTimeSeries(pm10);
+  series.addTimeSeries(voc);
+  series.addTimeSeries(temp);
+  series.addTimeSeries(humidity);
+  series.setDebug(Serial);
 }
 
 void loop()
@@ -327,26 +365,86 @@ void loop()
   }
 
   snprintf(lokiMsg, S_LENGTH, "msg=sen54 pm1=%.2f pm2_5=%.2f pm4=%.2f pm10=%.2f voc=%.2f hum=%.2f temp=%.2f rssi=%d", massConcentrationPm1p0, massConcentrationPm2p5, massConcentrationPm4p0, massConcentrationPm10p0, vocIndex, ambientHumidity, ambientTemperature, WiFi.RSSI());
-  if (!sensor.addEntry(client.getTimeNanos(), lokiMsg, strlen(lokiMsg)))
+  if (!lokiStream.addEntry(loki.getTimeNanos(), lokiMsg, strlen(lokiMsg)))
   {
-    Serial.println(sensor.errmsg);
+    Serial.println(lokiStream.errmsg);
   }
+
+  int64_t ptime = transport.getTimeMillis();
+  if (!pm1.addSample(ptime, massConcentrationPm1p0))
+  {
+    Serial.println(pm1.errmsg);
+  }
+  if (!pm2_5.addSample(ptime, massConcentrationPm2p5))
+  {
+    Serial.println(pm2_5.errmsg);
+  }
+  if (!pm4.addSample(ptime, massConcentrationPm4p0))
+  {
+    Serial.println(pm4.errmsg);
+  }
+  if (!pm10.addSample(ptime, massConcentrationPm10p0))
+  {
+    Serial.println(pm10.errmsg);
+  }
+  if (!voc.addSample(ptime, vocIndex))
+  {
+    Serial.println(voc.errmsg);
+  }
+  if (!temp.addSample(ptime, ambientTemperature))
+  {
+    Serial.println(temp.errmsg);
+  }
+  if (!humidity.addSample(ptime, ambientHumidity))
+  {
+    Serial.println(humidity.errmsg);
+  }
+
   // Send the message, we build in a few retries as well.
   uint64_t start = millis();
   for (uint8_t i = 0; i <= 5; i++)
   {
-    LokiClient::SendResult res = client.send(streams);
-    if (res != LokiClient::SendResult::SUCCESS)
+    PromClient::SendResult res = prom.send(series);
+    if (!res == PromClient::SendResult::SUCCESS)
     {
-      // Failed to send
-      Serial.println(client.errmsg);
-      delay(1000);
+      Serial.println(prom.errmsg);
+      delay(250);
     }
     else
     {
-      sensor.resetEntries();
+      // Batches are not automatically reset so that additional retry logic could be implemented by the library user.
+      // Reset batches after a succesful send.
+      pm1.resetSamples();
+      pm2_5.resetSamples();
+      pm4.resetSamples();
+      pm10.resetSamples();
+      voc.resetSamples();
+      temp.resetSamples();
+      humidity.resetSamples();
       uint32_t diff = millis() - start;
-      Serial.print("Send succesful in ");
+      Serial.print("Prom send succesful in ");
+      Serial.print(diff);
+      Serial.println("ms");
+      break;
+    }
+  }
+
+  // Send the message, we build in a few retries as well.
+  uint64_t lokiStart = millis();
+  for (uint8_t i = 0; i <= 5; i++)
+  {
+    LokiClient::SendResult res = loki.send(streams);
+    if (res != LokiClient::SendResult::SUCCESS)
+    {
+      // Failed to send
+      Serial.println(loki.errmsg);
+      delay(250);
+    }
+    else
+    {
+      lokiStream.resetEntries();
+      uint32_t diff = millis() - lokiStart;
+      Serial.print("Loki send succesful in ");
       Serial.print(diff);
       Serial.println("ms");
       break;
@@ -363,3 +461,40 @@ void loop()
   Serial.println("ms");
   delay(delayms);
 }
+/*
+MassConcentrationPm1p0:4.10     MassConcentrationPm2p5:4.30     MassConcentrationPm4p0:4.30     MassConcentrationPm10p0:4.30    AmbientHumidity:50.05   AmbientTemperature:24.72        VocIndex:13.00  NoxIndex:n/a
+Begin serialization: Free Heap: 205872
+Bytes used for serialization: 387
+After serialization: Free Heap: 205872
+After Compression Init: Free Heap: 205344
+Required buffer size for compression: 483
+Compressed Len: 177
+After Compression: Free Heap: 205872
+Sending To Prometheus
+Connection already open
+Sent, waiting for response
+Prom Send Succeeded
+Server: nginx/1.14.1
+Date: Mon, 16 May 2022 12:26:46 GMT
+Content-Length: 0
+Connection: keep-alive
+
+Prom send succesful in 251ms
+Begin serialization: Free Heap: 205872
+Bytes used for serialization: 141
+After serialization: Free Heap: 205872
+After Compression Init: Free Heap: 205344
+Required buffer size for compression: 196
+Compressed Len: 143
+After Compression: Free Heap: 205872
+Sending To Loki
+Connection already open
+Sent, waiting for response
+Loki Send Succeeded
+Server: nginx/1.14.1
+Date: Mon, 16 May 2022 12:26:47 GMT
+Connection: keep-alive
+
+Loki send succesful in 250ms
+Sleeping 498ms
+*/
