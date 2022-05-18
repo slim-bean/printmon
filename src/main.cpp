@@ -6,6 +6,7 @@
 #include <PrometheusArduino.h>
 #include "config.h"
 #include "certificates.h"
+#include <driver/pcnt.h>
 
 // For webserver
 #include <WiFi.h>
@@ -43,7 +44,29 @@ TimeSeries pm10(1, "pm10", "{job=\"printmon\"}");
 TimeSeries voc(1, "voc", "{job=\"printmon\"}");
 TimeSeries temp(1, "temp", "{job=\"printmon\"}");
 TimeSeries humidity(1, "humidity", "{job=\"printmon\"}");
-WriteRequest series(7);
+TimeSeries fan(1, "fan_rpm", "{job=\"printmon\",fan=\"int\"}");
+WriteRequest series(8,1024);
+
+// Timer used for counting fan speed
+hw_timer_t *timer = NULL;
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED; // Need a lock object for manipulating global state
+volatile uint16_t rpm = 0;                       // volatile because we update it from an interrupt
+volatile uint16_t count = 0;
+
+void IRAM_ATTR handleTimerInterrupt()
+{
+  portENTER_CRITICAL_ISR(&mux);
+  rpm = count * 60;
+  count = 0;
+  portEXIT_CRITICAL_ISR(&mux);
+}
+
+void IRAM_ATTR pcnt_intr_handler(void *arg)
+{
+  portENTER_CRITICAL_ISR(&mux);
+  count++;
+  portEXIT_CRITICAL_ISR(&mux);
+}
 
 void printModuleVersions()
 {
@@ -260,6 +283,52 @@ void setup()
     Serial.println(errorMessage);
   }
 
+  // Configure GPIO for measuring fan speed as input with pullup enabled
+  pinMode(5, INPUT_PULLUP);
+
+  // Define config for PCNT
+  pcnt_config_t pcnt_config = {
+      // Set PCNT input signal and control GPIOs
+      .pulse_gpio_num = 5,
+      .ctrl_gpio_num = -1,
+      // What to do when control input is low or high?
+      .lctrl_mode = PCNT_MODE_KEEP, // Keep the primary counter mode if low
+      .hctrl_mode = PCNT_MODE_KEEP, // Keep the primary counter mode if high
+      // What to do on the positive / negative edge of pulse input?
+      .pos_mode = PCNT_COUNT_DIS, // Keep the counter value on positive edge
+      .neg_mode = PCNT_COUNT_INC, // Count up on negative edge
+      // Set the maximum and minimum limit values to watch
+      .counter_h_lim = (int16_t)2, // There are 2 pulses per rotation and we want a callback when it hits 2
+      .counter_l_lim = 0,
+      .unit = PCNT_UNIT_0,
+      .channel = PCNT_CHANNEL_0,
+  };
+  pcnt_unit_config(&pcnt_config);
+  // The only event we want is when we reach the high limit to increment a counter
+  pcnt_event_enable(PCNT_UNIT_0, PCNT_EVT_H_LIM);
+  pcnt_isr_service_install(0);
+  // The unit is sent to the ISR as per the example but we don't really need it here.
+  pcnt_isr_handler_add(PCNT_UNIT_0, pcnt_intr_handler, (void *)PCNT_UNIT_0);
+
+  // Filter out pulses shorter than 100 clock cycles
+  pcnt_set_filter_value(PCNT_UNIT_0, 100);
+  pcnt_filter_enable(PCNT_UNIT_0);
+
+  // Pause and reset the counter so we can setup the timer
+  pcnt_counter_pause(PCNT_UNIT_0);
+  pcnt_counter_clear(PCNT_UNIT_0);
+
+  // Once a second we should see how many pulses there were to calculate the RPM
+  timer = timerBegin(0, 80, true);
+  timerAttachInterrupt(timer, &handleTimerInterrupt, true);
+  timerAlarmWrite(timer, 1000000, true);
+  timerAlarmEnable(timer);
+
+  // Resume pin counter
+  pcnt_counter_resume(PCNT_UNIT_0);
+
+  // Setup Loki and Prom streams and series
+
   streams.addStream(lokiStream);
   streams.setDebug(Serial);
 
@@ -270,6 +339,7 @@ void setup()
   series.addTimeSeries(voc);
   series.addTimeSeries(temp);
   series.addTimeSeries(humidity);
+  series.addTimeSeries(fan);
   series.setDebug(Serial);
 }
 
@@ -280,6 +350,12 @@ void loop()
   uint16_t error;
   char errorMessage[256];
   char lokiMsg[S_LENGTH] = {'\0'};
+
+  uint16_t fanRPM = 0;
+  // Get fan RPM
+  portENTER_CRITICAL_ISR(&mux);
+  fanRPM = rpm;
+  portEXIT_CRITICAL_ISR(&mux);
 
   // Read Measurement
   float massConcentrationPm1p0;
@@ -364,7 +440,7 @@ void loop()
     Serial.println(noxIndex);
   }
 
-  snprintf(lokiMsg, S_LENGTH, "msg=sen54 pm1=%.2f pm2_5=%.2f pm4=%.2f pm10=%.2f voc=%.2f hum=%.2f temp=%.2f rssi=%d", massConcentrationPm1p0, massConcentrationPm2p5, massConcentrationPm4p0, massConcentrationPm10p0, vocIndex, ambientHumidity, ambientTemperature, WiFi.RSSI());
+  snprintf(lokiMsg, S_LENGTH, "msg=sen54 pm1=%.2f pm2_5=%.2f pm4=%.2f pm10=%.2f voc=%.2f hum=%.2f temp=%.2f fan=%d rssi=%d", massConcentrationPm1p0, massConcentrationPm2p5, massConcentrationPm4p0, massConcentrationPm10p0, vocIndex, ambientHumidity, ambientTemperature, fanRPM, WiFi.RSSI());
   if (!lokiStream.addEntry(loki.getTimeNanos(), lokiMsg, strlen(lokiMsg)))
   {
     Serial.println(lokiStream.errmsg);
@@ -399,6 +475,10 @@ void loop()
   {
     Serial.println(humidity.errmsg);
   }
+  if (!fan.addSample(ptime, fanRPM))
+  {
+    Serial.println(fan.errmsg);
+  }
 
   // Send the message, we build in a few retries as well.
   uint64_t start = millis();
@@ -421,6 +501,7 @@ void loop()
       voc.resetSamples();
       temp.resetSamples();
       humidity.resetSamples();
+      fan.resetSamples();
       uint32_t diff = millis() - start;
       Serial.print("Prom send succesful in ");
       Serial.print(diff);
