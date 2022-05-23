@@ -10,3 +10,5 @@
 #define PROM_PATH "/api/v1/push"
 
 #define OTA_PASS ""
+
+#define WDT_TIMEOUT 300

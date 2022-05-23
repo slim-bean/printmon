@@ -7,6 +7,7 @@
 #include "config.h"
 #include "certificates.h"
 #include <driver/pcnt.h>
+#include <esp_task_wdt.h>
 
 // For webserver
 #include <WiFi.h>
@@ -45,7 +46,7 @@ TimeSeries voc(1, "voc", "{job=\"printmon\"}");
 TimeSeries temp(1, "temp", "{job=\"printmon\"}");
 TimeSeries humidity(1, "humidity", "{job=\"printmon\"}");
 TimeSeries fan(1, "fan_rpm", "{job=\"printmon\",fan=\"int\"}");
-WriteRequest series(8,1024);
+WriteRequest series(8, 1024);
 
 // Timer used for counting fan speed
 hw_timer_t *timer = NULL;
@@ -146,6 +147,11 @@ void printSerialNumber()
 void setup()
 {
   Serial.begin(115200);
+
+  // Start the watchdog timer, sometimes connecting to wifi or trying to set the time can fail in a way that never recovers
+  esp_task_wdt_init(WDT_TIMEOUT, true);
+  esp_task_wdt_add(NULL);
+
   // Wait 5s for serial connection or continue without it
   // some boards like the esp32 will run whether or not the
   // serial port is connected, others like the MKR boards will wait
@@ -345,6 +351,11 @@ void setup()
 
 void loop()
 {
+  // Reset watchdog, this also gives the most time to handle OTA
+  // be careful if your wdt reset is too quick you may want to disable
+  // it before OTA.
+  esp_task_wdt_reset();
+
   ArduinoOTA.handle();
 
   uint16_t error;
